@@ -42,9 +42,21 @@ async function fetchUpstream(path, qs = "") {
     "accept": "application/json",
   };
   if (COINGLASS_API_KEY) headers["CG-API-KEY"] = COINGLASS_API_KEY;
+  // --- debug logging (temporary) ---
+  console.log("DEBUG -> fetchUpstream:");
+  console.log("  url:", url);
+  console.log("  headers:", headers);
+  // --- end debug logging ---
 
   const res = await fetch(url, { method: "GET", headers, redirect: "follow" });
   const contentType = res.headers.get("content-type") || "";
+  console.log("DEBUG -> upstream response status:", res.status);
+  const ct = res.headers.get("content-type") || "";
+  console.log("DEBUG -> upstream contentType:", ct);
+
+  // only read small preview for debugging if not JSON parse attempt
+  const preview = await res.text().catch(() => "");
+  console.log("DEBUG -> upstream body (preview):", preview.slice(0, 500));
 
   if (!res.ok) {
     // try to get text for debugging
@@ -104,6 +116,7 @@ app.listen(PORT, () => {
   console.log("Available endpoints: /funding /oi /healthz");
   console.log(`COINGLASS_BASE=${COINGLASS_BASE}`);
 });
+
 
 
 

@@ -1,122 +1,146 @@
 // server.js (replace whole file)
+// ES module style like your repo showed earlier
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Default upstream CoinGlass base (v4)
+// Base (default) — use open-api-v4 as recommended
 const COINGLASS_BASE = process.env.COINGLASS_BASE_URL || "https://open-api-v4.coinglass.com";
-// Your CoinGlass API key (if you want proxy to call CoinGlass directly)
+// API key (if provided in Render env)
 const COINGLASS_API_KEY = process.env.COINGLASS_API_KEY || "";
 
-function buildUpstreamUrl(path, qs = "") {
-  // ensure path starts with /
-  const p = path.startsWith("/") ? path : `/${path}`;
-
-  // mapping short proxy paths to official CoinGlass API paths (v4)
-const mapping = {
-  "/funding": "/api/pro/v1/futures/funding-rate",
-  "/funding-history": "/api/pro/v1/futures/funding-rate/history",
-  "/oi": "/api/pro/v1/futures/openInterest",
-  "/healthz": "/api/pro/v1/healthz"
+/**
+ * mapping: short proxy path -> array of possible upstream API paths (try in order)
+ * We'll try each candidate until one returns ok (2xx) or non-404 (and return body).
+ */
+const MAPPING_CANDIDATES = {
+  "/funding": [
+    "/api/pro/v1/futures/funding",           // older / possible path
+    "/api/pro/v1/futures/funding-rate",      // alternate path
+    "/api/pro/v1/futures/funding-rate/history"
+  ],
+  "/funding-history": [
+    "/api/pro/v1/futures/funding-rate/history",
+    "/api/pro/v1/futures/funding-history"
+  ],
+  "/oi": [
+    "/api/pro/v1/futures/openInterest",
+    "/api/pro/v1/futures/open-interest"
+  ],
+  "/healthz": ["/api/pro/v1/healthz", "/health"]
 };
 
-
-
-  // pick upstream path
-  const upstreamPath = mapping[p] || p;
-
-  // query string
-  const qsPart = qs ? (qs.startsWith("?") ? qs : `?${qs}`) : "";
-
-  // ensure base has no trailing slash
-  const base = COINGLASS_BASE.replace(/\/+$/, "");
-
-  return `${base}${upstreamPath}${qsPart}`;
+// Ensure base has no trailing slash
+function baseNoSlash() {
+  return COINGLASS_BASE.replace(/\/+$/, "");
 }
 
-async function fetchUpstream(path, qs = "") {
-  const url = buildUpstreamUrl(path, qs);
-  const headers = {
-    "accept": "application/json",
-  };
-  if (COINGLASS_API_KEY) headers["CG-API-KEY"] = COINGLASS_API_KEY;
-  // --- debug logging (temporary) ---
-  console.log("DEBUG -> fetchUpstream:");
-  console.log("  url:", url);
-  console.log("  headers:", headers);
-  // --- end debug logging ---
+function buildUpstreamUrl(candidatePath, qs = "") {
+  const base = baseNoSlash();
+  const path = candidatePath.startsWith("/") ? candidatePath : `/${candidatePath}`;
+  return `${base}${path}${qs ? (qs.startsWith("?") ? qs : `?${qs}`) : ""}`;
+}
 
-  const res = await fetch(url, { method: "GET", headers, redirect: "follow" });
-  const contentType = res.headers.get("content-type") || "";
-  console.log("DEBUG -> upstream response status:", res.status);
-  const ct = res.headers.get("content-type") || "";
-  console.log("DEBUG -> upstream contentType:", ct);
+async function fetchUpstream(shortPath, qs = "") {
+  // pick candidate list
+  const candidates = MAPPING_CANDIDATES[shortPath] || [shortPath];
+  let lastError = null;
 
-  // only read small preview for debugging if not JSON parse attempt
-  const preview = await res.text().catch(() => "");
-  console.log("DEBUG -> upstream body (preview):", preview.slice(0, 500));
+  for (const cand of candidates) {
+    const url = buildUpstreamUrl(cand, qs);
+    const headers = {
+      "accept": "application/json",
+      "user-agent": "coinglass-proxy/1.0"
+    };
+    if (COINGLASS_API_KEY) headers["CG-API-KEY"] = COINGLASS_API_KEY;
 
-  if (!res.ok) {
-    // try to get text for debugging
+    console.log("DEBUG -> fetchUpstream trying url:", url);
+    console.log("DEBUG -> fetchUpstream headers:", Object.keys(headers).join(","));
+
+    let res;
+    try {
+      res = await fetch(url, { method: "GET", headers, redirect: "follow" });
+    } catch (err) {
+      lastError = { type: "network", message: String(err), url };
+      console.warn("WARN -> fetchUpstream network error:", err);
+      continue; // try next candidate
+    }
+
+    // read text (safe)
     const text = await res.text().catch(() => "");
-    throw { status: res.status, body: text, contentType };
+    const contentType = res.headers.get("content-type") || "";
+
+    console.log("DEBUG -> upstream status:", res.status, "contentType:", contentType);
+    console.log("DEBUG -> upstream body preview:", text.slice(0, 400));
+
+    if (!res.ok) {
+      // if 404, try next candidate
+      lastError = { status: res.status, body: text, url, contentType };
+      console.warn("WARN -> upstream not ok:", res.status, "url:", url);
+      // if it's 404 or 502 try next candidate; otherwise for 2xx we would have returned
+      continue;
+    }
+
+    // if response ok, try parse JSON
+    if (contentType.includes("application/json") || contentType.includes("text/plain")) {
+      try {
+        const json = JSON.parse(text);
+        return { success: true, upstream_status: res.status, upstream_ok: true, body: json, url, contentType };
+      } catch (err) {
+        // sometimes server returns plain text but with json-like; return text
+        return { success: true, upstream_status: res.status, upstream_ok: true, body: text, url, contentType };
+      }
+    } else {
+      // not JSON (HTML etc) — return as text
+      return { success: true, upstream_status: res.status, upstream_ok: true, body: text, url, contentType };
+    }
   }
 
-  // if response is JSON, parse it, otherwise return text
-  if (contentType.includes("application/json")) {
-    const json = await res.json();
-    return json;
-  } else {
-    const text = await res.text();
-    return { raw: text, contentType };
-  }
+  // none succeeded
+  return { success: false, upstream_status: lastError && lastError.status ? lastError.status : 500, upstream_ok: false, message: lastError ? lastError : "no-candidates", body: lastError && lastError.body ? lastError.body : "" };
 }
 
-// Simple proxy endpoints you need
-app.get("/funding", async (req, res) => {
+// Proxy endpoint pattern: /<shortPath>?<qs>
+// e.g. GET /funding?symbol=BTC
+app.get("/:short", async (req, res) => {
+  const short = `/${req.params.short}`;
+  const qs = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
   try {
-    const symbol = req.query.symbol || req.query.s || "BTC";
-    // Example upstream path: /api/futures/funding
-    const data = await fetchUpstream("/api/futures/funding", `symbol=${encodeURIComponent(symbol)}`);
-    return res.json({ success: true, data });
+    const result = await fetchUpstream(short, qs);
+    // propagate status codes clearly for debugging
+    if (!result.success) {
+      // return JSON with upstream info
+      return res.status(502).json({
+        success: false,
+        upstream_status: result.upstream_status || 502,
+        upstream_ok: false,
+        message: result.message || "upstream failed",
+        body_preview: (result.body && typeof result.body === "string") ? result.body.slice(0, 800) : result.body
+      });
+    }
+    // success -> send upstream body directly if object, otherwise send wrapper
+    if (typeof result.body === "object") {
+      return res.status(200).json(result.body);
+    } else {
+      // text body
+      return res.status(200).type(result.contentType || "text/plain").send(result.body);
+    }
   } catch (err) {
-    console.error("Upstream error:", err);
-    // return structured error so monitor can handle nicely
-    return res.status(err.status || 502).json({
-      success: false,
-      upstream_status: err.status || 502,
-      upstream_ok: !!(err.status && err.status >= 200 && err.status < 300),
-      message: err.body || "Upstream failed and no cache",
-      contentType: err.contentType || null
-    });
+    console.error("ERROR -> unexpected:", err);
+    return res.status(500).json({ success: false, error: String(err) });
   }
 });
 
-app.get("/oi", async (req, res) => {
-  try {
-    const symbol = req.query.symbol || "BTC";
-    const data = await fetchUpstream("/api/futures/open_interest", `symbol=${encodeURIComponent(symbol)}`);
-    return res.json({ success: true, data });
-  } catch (err) {
-    console.error("Upstream error:", err);
-    return res.status(err.status || 502).json({
-      success: false,
-      upstream_status: err.status || 502,
-      message: err.body || "Upstream failed"
-    });
-  }
+// simple health
+app.get("/__health", (req, res) => {
+  res.json({ ok: true, base: COINGLASS_BASE, hasKey: !!COINGLASS_API_KEY });
 });
-
-app.get("/healthz", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.listen(PORT, () => {
-  console.log(`Coinglass Proxy Running on Port ${PORT}`);
-  console.log("Available endpoints: /funding /oi /healthz");
-  console.log(`COINGLASS_BASE=${COINGLASS_BASE}`);
+  console.log("CoinGlass Proxy Running on Port", PORT);
+  console.log("Available endpoints:", Object.keys(MAPPING_CANDIDATES).join(", "));
+  console.log("COINGLASS_BASE=", COINGLASS_BASE);
+  console.log("COINGLASS_API_KEY set:", !!COINGLASS_API_KEY);
 });
-
-
-
-

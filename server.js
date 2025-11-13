@@ -1,95 +1,91 @@
+// server.js
 import express from "express";
-import cors from "cors";
 import fetch from "node-fetch";
 
 const app = express();
-app.use(cors());
-
-// ========= ENV =========
-const API_KEY = process.env.COINGLASS_API_KEY;       // <— API KEY Coinglass
 const PORT = process.env.PORT || 10000;
+const COINGLASS_API_KEY = process.env.COINGLASS_API_KEY || "";
+const BASE = process.env.CG_BASE || "https://open-api-v4.coinglass.com"; // official v4 base
 
-// LOG bwt cek
-console.log("COINGLASS_API_KEY:", API_KEY ? "Loaded" : "NOT FOUND");
+if (!COINGLASS_API_KEY) {
+  console.error("ERROR: COINGLASS_API_KEY is not set in env");
+  process.exit(1);
+}
 
-// ========= FUNDING ENDPOINT =========
+// simple in-memory cache for endpoints: { key: { ts, body } }
+const cache = new Map();
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS ?? 60_000); // 60s default
+
+async function fetchWithRetry(url, opts = {}, maxAttempts = 3) {
+  let attempt = 0;
+  let backoff = 500;
+  while (attempt < maxAttempts) {
+    try {
+      const res = await fetch(url, opts);
+      const text = await res.text();
+      // try parse as json
+      let data;
+      try { data = JSON.parse(text); } catch(e){ data = text; }
+      if (!res.ok) {
+        // non 2xx => throw so caller handles / retry
+        const err = new Error(`Upstream ${res.status} ${res.statusText}`);
+        err.status = res.status;
+        err.body = data;
+        throw err;
+      }
+      return data;
+    } catch (err) {
+      attempt++;
+      if (attempt >= maxAttempts) throw err;
+      await new Promise(r => setTimeout(r, backoff));
+      backoff *= 2;
+    }
+  }
+}
+
 app.get("/funding", async (req, res) => {
-  const symbol = req.query.symbol || "BTC";
+  const symbol = (req.query.symbol || "").toUpperCase();
+  if (!symbol) return res.status(400).json({ error: "missing symbol" });
 
-  const url = `https://open-api.coinglass.com/api/pro/v1/futures/funding?symbol=${symbol}`;
+  const path = `/api/futures/funding-rate/history?symbol=${encodeURIComponent(symbol)}&limit=1`;
+  const url = `${BASE}${path}`;
+  const cacheKey = `funding:${symbol}`;
+
+  // Return cached if fresh
+  const cached = cache.get(cacheKey);
+  if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
+    return res.json({ code: 0, fromCache: true, data: cached.body });
+  }
+
+  const opts = {
+    method: "GET",
+    headers: {
+      "accept": "application/json",
+      "CG-API-KEY": COINGLASS_API_KEY
+    },
+    timeout: 10_000
+  };
 
   try {
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        "accept": "application/json",
-        "coinglassSecret": API_KEY   // <— WAJIB ADA
-      }
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error("Funding fetch error:", data);
-      return res.status(response.status).json({
-        error: true,
-        status: response.status,
-        data
-      });
-    }
-
-    res.json(data);
-
+    const data = await fetchWithRetry(url, opts, 3);
+    // cache if looks valid
+    cache.set(cacheKey, { ts: Date.now(), body: data });
+    return res.json({ code: 0, fromCache: false, data });
   } catch (err) {
-    console.error("Funding fetch FAILED:", err);
-    res.status(500).json({
-      error: true,
-      message: err.message
-    });
+    console.error("Upstream error:", err.status ?? err.message, err.body ?? "");
+    // if we have any cache return it (best-effort)
+    if (cached) {
+      return res.json({ code: "cached", fromCache: true, data: cached.body, note: "upstream failed" });
+    }
+    // No cache => return error to caller
+    const status = err.status || 502;
+    return res.status(502).json({ error: "Upstream failed and no cache", detail: err.body ?? err.message });
   }
 });
 
-// ========= OI ENDPOINT =========
-app.get("/oi", async (req, res) => {
-  const symbol = req.query.symbol || "BTC";
+app.get("/healthz", (req, res) => res.json({ ok: true }));
 
-  const url = `https://open-api.coinglass.com/api/pro/v1/futures/openInterest?symbol=${symbol}`;
-
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        "accept": "application/json",
-        "coinglassSecret": API_KEY   // <— WAJIB ADA
-      }
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error("OI fetch error:", data);
-      return res.status(response.status).json({
-        error: true,
-        status: response.status,
-        data
-      });
-    }
-
-    res.json(data);
-
-  } catch (err) {
-    console.error("OI fetch FAILED:", err);
-    res.status(500).json({
-      error: true,
-      message: err.message
-    });
-  }
+app.listen(PORT, () => {
+  console.log(`CoinGlass Proxy running on Port ${PORT}`);
+  console.log(`Available endpoints: /funding?symbol=BTC  /healthz`);
 });
-
-// ========= HEALTH =========
-app.get("/healthz", (req, res) => res.send("OK"));
-
-// ========= START =========
-app.listen(PORT, () =>
-  console.log(`Coinglass Proxy Running on Port ${PORT}`)
-);

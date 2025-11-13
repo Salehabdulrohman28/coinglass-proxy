@@ -13,11 +13,12 @@ const COINGLASS_BASE = "https://open-api-v4.coinglass.com";
 const COINGLASS_API_KEY = process.env.COINGLASS_API_KEY || "";
 
 // Mapping endpoint proxy
-const MAP = {
-  "/funding": "/api/pro/v1/futures/funding",
-  "/oi": "/api/pro/v1/futures/openInterest",
-  "/funding-history": "/api/pro/v1/futures/funding-rate/history",
-  "/healthz": "/api/pro/v1/healthz"
+const mapping = {
+  "/funding": "/api/pro/v1/futures/funding",                          // funding current
+  "/funding-history": "/api/pro/v1/futures/funding-rate/history",     // funding history
+  "/funding-rate": "/api/pro/v1/futures/funding-rate",                // funding rate endpoint (if ada)
+  "/oi": "/api/pro/v1/futures/openInterest",                          // open interest
+  "/healthz": "/api/pro/v1/healthz"                                   // health check
 };
 
 // Build URL lengkap ke CoinGlass
@@ -105,3 +106,4 @@ app.listen(PORT, () => {
   console.log(" Available:", "/funding /oi /funding-history /healthz");
   console.log("===========================================");
 });
+

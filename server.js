@@ -1,98 +1,77 @@
-// server.js
 import express from "express";
 import fetch from "node-fetch";
+import cors from "cors";
 
 const app = express();
-app.use(express.json());
+app.use(cors());
 
-const PORT = process.env.PORT || 10000;
-const COINGLASS_API_KEY = process.env.COINGLASS_API_KEY || "";
-const BASE_URL = process.env.BASE_URL || "https://open-api-v4.coinglass.com";
-const CACHE_TTL_MS = 30 * 1000; // 30s
-
-if (!COINGLASS_API_KEY) {
-  console.error("WARNING: COINGLASS_API_KEY not set in env!");
+// ==========================================================
+const API_KEY = process.env.COINGLASS_API_KEY;
+if (!API_KEY) {
+  console.error("❌ Missing COINGLASS_API_KEY in environment!");
 }
 
-const cache = new Map();
+const HEADERS = {
+  "accept": "application/json",
+  "CoinglassSecret": API_KEY
+};
+// ==========================================================
 
-function now() { return Date.now(); }
-
-async function fetchWithRetry(url, opts = {}, attempts = 3, backoff = 500) {
-  let lastErr;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const res = await fetch(url, opts);
-      const text = await res.text();
-      let body;
-      try { body = JSON.parse(text); } catch(e) { body = text; }
-      if (!res.ok) {
-        const err = new Error(`HTTP ${res.status}`);
-        err.status = res.status;
-        err.body = body;
-        throw err;
-      }
-      return body;
-    } catch (err) {
-      lastErr = err;
-      if (i < attempts - 1) await new Promise(r => setTimeout(r, backoff * (i+1)));
-    }
-  }
-  throw lastErr;
-}
-
-app.get("/", (req, res) => res.json({ ok: true, msg: "coinglass-proxy alive" }));
-
+// FUNDING RATE
 app.get("/funding", async (req, res) => {
-  const symbol = (req.query.symbol || process.env.SYMBOL || "BTC").toUpperCase();
-  const cacheKey = `funding:${symbol}`;
-  const cached = cache.get(cacheKey);
-  if (cached && (now() - cached.ts) < CACHE_TTL_MS) {
-    return res.json({ code: 0, fromCache: true, data: cached.body });
-  }
-
-  const headers = { "CG-API-KEY": COINGLASS_API_KEY, "Accept": "application/json" };
-  const primary = `${BASE_URL}/api/futures/funding-rate/history?symbol=${encodeURIComponent(symbol)}&limit=1`;
-
-  // fallback endpoints to try if primary fails
-  const fallbacks = [
-    primary,
-    `${BASE_URL}/api/pro/v1/futures/funding?symbol=${encodeURIComponent(symbol)}`,
-    // add more variations if needed
-  ];
-
-  let lastErr = null;
-  const opts = { method: "GET", headers };
-
   try {
-    for (const u of fallbacks) {
-      try {
-        const data = await fetchWithRetry(u, opts, 3);
-        cache.set(cacheKey, { ts: now(), body: data });
-        return res.json({ code: 0, fromCache: false, data, urlUsed: u });
-      } catch (err) {
-        console.error("Fetch attempt failed for", u, { message: err.message, status: err.status, body: err.body });
-        lastErr = err;
-        // try next fallback
-      }
-    }
+    const symbol = req.query.symbol || "BTC";
 
-    // all fallbacks failed
-    if (cached) {
-      return res.json({ code: "cached", fromCache: true, data: cached.body, note: "upstream failed" });
-    }
-    const detail = lastErr ? (lastErr.body ?? lastErr.message) : "unknown";
-    return res.status(502).json({ error: "Upstream failed and no cache", detail });
+    const url = `https://open-api.coinglass.com/api/pro/v1/futures/funding?symbol=${symbol}`;
+
+    const response = await fetch(url, { headers: HEADERS });
+    const data = await response.json();
+
+    if (!response.ok) return res.status(response.status).json(data);
+
+    // Ambil hanya Binance data
+    const binance = data.data.find(ex => ex.exchangeName === "Binance");
+
+    res.json({
+      exchange: "Binance",
+      funding_rate: binance?.fundingRate || null
+    });
+
   } catch (err) {
-    console.error("Unexpected proxy error:", err);
-    return res.status(500).json({ error: "Internal proxy error", message: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// healthz
-app.get("/healthz", (req, res) => res.json({ ok: true }));
 
-app.listen(PORT, ()=> {
-  console.log(`CoinGlass Proxy Running on Port ${PORT}`);
-  console.log("Available endpoints: /funding /healthz");
+// OPEN INTEREST
+app.get("/oi", async (req, res) => {
+  try {
+    const symbol = req.query.symbol || "BTC";
+
+    const url = `https://open-api.coinglass.com/api/pro/v1/futures/openInterest?symbol=${symbol}`;
+
+    const response = await fetch(url, { headers: HEADERS });
+    const data = await response.json();
+
+    if (!response.ok) return res.status(response.status).json(data);
+
+    const binance = data.data.find(ex => ex.exchangeName === "Binance");
+
+    res.json({
+      exchange: "Binance",
+      open_interest_usd: binance?.openInterest || null
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
+
+// HEALTH CHECK
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+// START SERVER
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Coinglass Proxy Running on Port ${PORT}`));

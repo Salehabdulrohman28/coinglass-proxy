@@ -3,89 +3,96 @@ import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
+app.use(express.json());
+
 const PORT = process.env.PORT || 10000;
 const COINGLASS_API_KEY = process.env.COINGLASS_API_KEY || "";
-const BASE = process.env.CG_BASE || "https://open-api-v4.coinglass.com"; // official v4 base
+const BASE_URL = process.env.BASE_URL || "https://open-api-v4.coinglass.com";
+const CACHE_TTL_MS = 30 * 1000; // 30s
 
 if (!COINGLASS_API_KEY) {
-  console.error("ERROR: COINGLASS_API_KEY is not set in env");
-  process.exit(1);
+  console.error("WARNING: COINGLASS_API_KEY not set in env!");
 }
 
-// simple in-memory cache for endpoints: { key: { ts, body } }
 const cache = new Map();
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS ?? 60_000); // 60s default
 
-async function fetchWithRetry(url, opts = {}, maxAttempts = 3) {
-  let attempt = 0;
-  let backoff = 500;
-  while (attempt < maxAttempts) {
+function now() { return Date.now(); }
+
+async function fetchWithRetry(url, opts = {}, attempts = 3, backoff = 500) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
     try {
       const res = await fetch(url, opts);
       const text = await res.text();
-      // try parse as json
-      let data;
-      try { data = JSON.parse(text); } catch(e){ data = text; }
+      let body;
+      try { body = JSON.parse(text); } catch(e) { body = text; }
       if (!res.ok) {
-        // non 2xx => throw so caller handles / retry
-        const err = new Error(`Upstream ${res.status} ${res.statusText}`);
+        const err = new Error(`HTTP ${res.status}`);
         err.status = res.status;
-        err.body = data;
+        err.body = body;
         throw err;
       }
-      return data;
+      return body;
     } catch (err) {
-      attempt++;
-      if (attempt >= maxAttempts) throw err;
-      await new Promise(r => setTimeout(r, backoff));
-      backoff *= 2;
+      lastErr = err;
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, backoff * (i+1)));
     }
   }
+  throw lastErr;
 }
 
+app.get("/", (req, res) => res.json({ ok: true, msg: "coinglass-proxy alive" }));
+
 app.get("/funding", async (req, res) => {
-  const symbol = (req.query.symbol || "").toUpperCase();
-  if (!symbol) return res.status(400).json({ error: "missing symbol" });
-
-  const path = `/api/futures/funding-rate/history?symbol=${encodeURIComponent(symbol)}&limit=1`;
-  const url = `${BASE}${path}`;
+  const symbol = (req.query.symbol || process.env.SYMBOL || "BTC").toUpperCase();
   const cacheKey = `funding:${symbol}`;
-
-  // Return cached if fresh
   const cached = cache.get(cacheKey);
-  if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
+  if (cached && (now() - cached.ts) < CACHE_TTL_MS) {
     return res.json({ code: 0, fromCache: true, data: cached.body });
   }
 
-  const opts = {
-    method: "GET",
-    headers: {
-      "accept": "application/json",
-      "CG-API-KEY": COINGLASS_API_KEY
-    },
-    timeout: 10_000
-  };
+  const headers = { "CG-API-KEY": COINGLASS_API_KEY, "Accept": "application/json" };
+  const primary = `${BASE_URL}/api/futures/funding-rate/history?symbol=${encodeURIComponent(symbol)}&limit=1`;
+
+  // fallback endpoints to try if primary fails
+  const fallbacks = [
+    primary,
+    `${BASE_URL}/api/pro/v1/futures/funding?symbol=${encodeURIComponent(symbol)}`,
+    // add more variations if needed
+  ];
+
+  let lastErr = null;
+  const opts = { method: "GET", headers };
 
   try {
-    const data = await fetchWithRetry(url, opts, 3);
-    // cache if looks valid
-    cache.set(cacheKey, { ts: Date.now(), body: data });
-    return res.json({ code: 0, fromCache: false, data });
-  } catch (err) {
-    console.error("Upstream error:", err.status ?? err.message, err.body ?? "");
-    // if we have any cache return it (best-effort)
+    for (const u of fallbacks) {
+      try {
+        const data = await fetchWithRetry(u, opts, 3);
+        cache.set(cacheKey, { ts: now(), body: data });
+        return res.json({ code: 0, fromCache: false, data, urlUsed: u });
+      } catch (err) {
+        console.error("Fetch attempt failed for", u, { message: err.message, status: err.status, body: err.body });
+        lastErr = err;
+        // try next fallback
+      }
+    }
+
+    // all fallbacks failed
     if (cached) {
       return res.json({ code: "cached", fromCache: true, data: cached.body, note: "upstream failed" });
     }
-    // No cache => return error to caller
-    const status = err.status || 502;
-    return res.status(502).json({ error: "Upstream failed and no cache", detail: err.body ?? err.message });
+    const detail = lastErr ? (lastErr.body ?? lastErr.message) : "unknown";
+    return res.status(502).json({ error: "Upstream failed and no cache", detail });
+  } catch (err) {
+    console.error("Unexpected proxy error:", err);
+    return res.status(500).json({ error: "Internal proxy error", message: err.message });
   }
 });
 
+// healthz
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () => {
-  console.log(`CoinGlass Proxy running on Port ${PORT}`);
-  console.log(`Available endpoints: /funding?symbol=BTC  /healthz`);
+app.listen(PORT, ()=> {
+  console.log(`CoinGlass Proxy Running on Port ${PORT}`);
+  console.log("Available endpoints: /funding /healthz");
 });

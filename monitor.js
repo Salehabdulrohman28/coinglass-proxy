@@ -1,192 +1,194 @@
 // monitor.js
-// Robust CoinGlass monitor + Discord notifier
-// Usage: node monitor.js
-// Env vars:
-//   DISCORD_WEBHOOK  -> discord webhook url (required for alerts)
-//   COINGLASS_API_KEY -> optional CoinGlass API key
-//   SYMBOL -> symbol to monitor (BTC default)
-//   POLL_INTERVAL_MS -> polling interval (ms), default 30000
-//   BASE_URL -> optional override for CoinGlass base, default open-api-v4
+// Node (ES module). Uses global fetch (Node >=18). Replace whole file in repo.
 
-import fetchPkg from "node-fetch";
-const fetch = fetchPkg.default || fetchPkg; // ensure compatibility
+import { setTimeout as wait } from "node:timers/promises";
 
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || "";
 const COINGLASS_API_KEY = process.env.COINGLASS_API_KEY || "";
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
 const SYMBOL = (process.env.SYMBOL || "BTC").toUpperCase();
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 30000);
-const BASE_URL = (process.env.BASE_URL || "https://open-api-v4.coinglass.com").replace(/\/+$/,"");
+const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
 
-if (!DISCORD_WEBHOOK) {
-  console.warn("WARNING: DISCORD_WEBHOOK not set — alerts will be skipped.");
-}
+function logDebug(...args) { if (["debug"].includes(LOG_LEVEL)) console.debug(...args); }
+function logInfo(...args) { if (["debug","info"].includes(LOG_LEVEL)) console.log(...args); }
+function logWarn(...args) { console.warn(...args); }
+function logError(...args) { console.error(...args); }
 
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-
-// Candidate upstream paths to try (order matters). These are *relative* to BASE_URL.
-// We attempt each until one returns a successful JSON or text body.
+/**
+ * Candidate upstream endpoints to try (relative to https://open-api-v4.coinglass.com)
+ * We will try these in order until one returns a successful JSON response.
+ * If CoinGlass changes endpoints, add/remove candidates here.
+ */
 const CANDIDATE_PATHS = [
-  "/api/pro/v1/futures/funding",                     // older/possible path
+  "/api/pro/v1/futures/funding",                    // funding (current)
+  "/api/pro/v1/futures/funding-rate",               // funding rate
   "/api/pro/v1/futures/funding-rate/history",       // funding history
-  "/api/futures/funding",                            // alternate
-  "/api/futures/funding-rate/history",               // alternate
-  "/api/pro/v1/futures/funding-rate",                // another guess
-  "/api/pro/v1/futures/funding-rate/history?limit=1" // fallback with query
+  "/api/pro/v1/futures/funding-rate?limit=1",       // variant
 ];
 
-// small helper to build final url
-function buildUrl(base, path, params = {}) {
-  let url = base + (path.startsWith("/") ? path : "/" + path);
-  // if params object -> append as query string
-  const q = new URLSearchParams(params).toString();
-  if (q) url += (url.includes("?") ? "&" : "?") + q;
-  return url;
+/** build full url for a candidate with symbol query */
+function buildUrl(path, symbol) {
+  const base = "https://open-api-v4.coinglass.com";
+  const sep = path.includes("?") ? "&" : "?";
+  return `${base}${path}${sep}symbol=${encodeURIComponent(symbol)}`;
 }
 
-async function fetchUpstreamTry(url) {
+/** safe fetch with headers */
+async function fetchJson(url, timeoutMs = 10000) {
   const headers = {
-    accept: "application/json, text/plain, */*",
-    "user-agent": "coinglass-proxy-monitor/1"
+    "accept": "application/json",
+    "user-agent": "coinglass-monitor/1.0 (+https://github.com/)",
   };
   if (COINGLASS_API_KEY) headers["CG-API-KEY"] = COINGLASS_API_KEY;
+
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    const res = await fetch(url, { method: "GET", headers, redirect: "follow", timeout: 15000 });
+    logDebug("fetchJson ->", url, "headers:", Object.keys(headers));
+    const res = await fetch(url, { method: "GET", headers, signal: controller.signal });
+    clearTimeout(id);
     const contentType = res.headers.get("content-type") || "";
-    const status = res.status;
-    let bodyText = "";
-    try {
-      bodyText = await res.text();
-    } catch (e) {
-      bodyText = "";
+
+    // If not ok, try to get text for debugging
+    if (!res.ok) {
+      const raw = await res.text().catch(() => null);
+      return { ok: false, status: res.status, contentType, raw };
     }
-    // If JSON-like return parsed JSON
-    if (contentType.includes("application/json") || (/^\s*\{/.test(bodyText) || /^\s*\[/.test(bodyText))) {
-      try {
-        const json = JSON.parse(bodyText || "{}");
-        return { ok: res.ok, status, contentType, body: json, raw: bodyText };
-      } catch (e) {
-        // invalid JSON but we still return text
-        return { ok: res.ok, status, contentType, body: null, raw: bodyText, parseError: e.message };
-      }
-    } else {
-      // non-JSON -> return text
-      return { ok: res.ok, status, contentType, body: null, raw: bodyText };
+
+    // If JSON
+    if (contentType.includes("application/json")) {
+      const json = await res.json().catch(e => ({ parseError: String(e) }));
+      return { ok: true, status: res.status, contentType, json };
     }
+
+    // fallback: text
+    const text = await res.text().catch(() => null);
+    return { ok: true, status: res.status, contentType, text };
   } catch (err) {
-    return { ok: false, error: err.message || String(err) };
+    clearTimeout(id);
+    return { ok: false, error: String(err) };
   }
 }
 
-async function findWorkingEndpoint() {
-  // try each candidate with symbol param
-  for (const p of CANDIDATE_PATHS) {
-    // ensure symbol param present if no query already present
-    const url = p.includes("?") ? buildUrl(BASE_URL, p + `&symbol=${SYMBOL}`) : buildUrl(BASE_URL, p, { symbol: SYMBOL });
-    console.debug("DEBUG -> fetchUpstream trying url:", url);
-    const res = await fetchUpstreamTry(url);
-    if (res.ok && (res.body !== null || (res.raw && res.raw.length > 0))) {
-      // Good response (200-ish). Return endpoint + body
-      return { url, res };
+/** try candidate endpoints sequentially */
+async function tryCandidates(symbol) {
+  for (const path of CANDIDATE_PATHS) {
+    const url = buildUrl(path, symbol);
+    logInfo(`Trying upstream: ${url}`);
+    const r = await fetchJson(url, 12000);
+    if (r.ok && (r.json || r.text)) {
+      logInfo("Upstream success:", path, "status:", r.status || "200");
+      return { url, path, resp: r };
     } else {
-      // log why not ok (for debugging)
-      console.debug("DEBUG -> upstream not ok:", res);
+      logWarn("Upstream not ok:", { path, status: r.status, contentType: r.contentType, raw: r.raw || r.error });
+      // small delay between tries
+      await wait(250);
     }
-    // small pause between attempts
-    await sleep(300);
   }
   return null;
 }
 
-async function postDiscord(content, embeds) {
-  if (!DISCORD_WEBHOOK) return;
-  const payload = {
-    content,
-    embeds: embeds ? embeds : undefined
-  };
+/** send to discord */
+async function postDiscord(content, embed = null) {
+  if (!DISCORD_WEBHOOK_URL) {
+    logWarn("DISCORD_WEBHOOK_URL not configured; skipping Discord post");
+    return;
+  }
+  const payload = embed ? { content, embeds: [embed] } : { content };
   try {
-    await fetch(DISCORD_WEBHOOK, {
+    const res = await fetch(DISCORD_WEBHOOK_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
     });
-  } catch (e) {
-    console.error("Error sending Discord webhook:", e.message || e);
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      logWarn("Discord webhook returned non-OK:", res.status, text);
+    } else {
+      logInfo("Discord webhook sent");
+    }
+  } catch (err) {
+    logError("Error posting to Discord:", err);
   }
 }
 
-// Monitoring loop
-let consecutiveErrors = 0;
-const ERROR_ALERT_THRESHOLD = 3; // after this many consecutive fails we send alert
+/** format limited JSON preview */
+function preview(obj, max = 1200) {
+  try {
+    const s = JSON.stringify(obj, null, 2);
+    if (s.length <= max) return s;
+    return s.slice(0, max-3) + "...";
+  } catch (e) {
+    return String(obj).slice(0, max);
+  }
+}
 
-async function monitorLoop() {
-  console.log(`Monitor starting — SYMBOL=${SYMBOL} BASE=${BASE_URL} POLL_INTERVAL_MS=${POLL_INTERVAL_MS}`);
+/** main loop */
+async function mainLoop() {
+  logInfo("Monitor starting:", SYMBOL, "interval(ms):", POLL_INTERVAL_MS);
+  let consecutiveErrors = 0;
+  let backoffMs = 0;
+
   while (true) {
     try {
-      const found = await findWorkingEndpoint();
-      if (!found) {
+      if (backoffMs > 0) {
+        logInfo("Backing off for", backoffMs, "ms");
+        await wait(backoffMs);
+      }
+
+      const result = await tryCandidates(SYMBOL);
+
+      if (!result) {
+        // no working upstream found
         consecutiveErrors++;
-        console.warn(`No working upstream path found (attempt). consecutiveErrors=${consecutiveErrors}`);
-        if (consecutiveErrors >= ERROR_ALERT_THRESHOLD) {
-          await postDiscord(`:warning: ALERT — Funding fetch repeatedly failed for ${SYMBOL}. Tried candidate endpoints against ${BASE_URL} (see logs). consecutiveErrors=${consecutiveErrors}`);
+        logWarn("No working upstream path found. consecutiveErrors=", consecutiveErrors);
+        if (consecutiveErrors >= 3) {
+          await postDiscord(`:warning: ALERT — Funding fetch repeatedly failed for ${SYMBOL}. Tried candidate endpoints but none returned JSON. consecutiveErrors=${consecutiveErrors}`, {
+            title: "Funding fetch repeatedly failed",
+            description: `Tried endpoints: ${CANDIDATE_PATHS.join(", ")}`,
+          });
         }
-        // wait and retry with backoff
-        await sleep(Math.min(POLL_INTERVAL_MS * Math.max(1, consecutiveErrors), 120000));
+        backoffMs = Math.min(60000, (consecutiveErrors ** 2) * 1000);
+        await wait(Math.min(5000, backoffMs));
         continue;
       }
 
-      // reset error counter
+      // success
       consecutiveErrors = 0;
+      backoffMs = 0;
 
-      const { url, res } = found;
-      // Inspect res.status / body for expected fields
-      if (!res.ok) {
-        console.warn(`Upstream returned not-ok status ${res.status} url=${url}`);
-        await postDiscord(`:x: Monitor error: upstream returned status ${res.status} for ${SYMBOL}. url: ${url}`);
-        await sleep(POLL_INTERVAL_MS);
-        continue;
-      }
+      const { url, path, resp } = result;
+      logInfo("Got upstream response from:", url, "status:", resp.status, "contentType:", resp.contentType);
 
-      // Parse the data: depends on what CoinGlass returns. We'll try to normalize:
-      let data = res.body;
-      if (!data && res.raw) {
-        // not JSON or empty JSON — include raw
-        console.log("Upstream returned text:", res.raw.slice(0, 800));
-        await postDiscord(`:information_source: Monitor info: upstream returned non-JSON body for ${SYMBOL}. url: ${url}\n\`\`\`\n${res.raw.slice(0,1000)}\n\`\`\``);
-        await sleep(POLL_INTERVAL_MS);
-        continue;
-      }
+      // build message for discord
+      let textPreview = resp.json ? preview(resp.json) : (resp.text || preview(resp.raw || resp.error));
+      const embed = {
+        title: `Funding update — ${SYMBOL}`,
+        description: `Upstream: \`${path}\`\nURL: ${url}\n\`\`\`json\n${textPreview}\n\`\`\``,
+        timestamp: new Date().toISOString()
+      };
 
-      // If data includes error code returned by CoinGlass, handle
-      if (typeof data === "object" && (data.code || data.error || data.success === false)) {
-        console.warn("Upstream body indicates error:", data);
-        await postDiscord(`:warning: Monitor error from upstream for ${SYMBOL} — ${JSON.stringify(data).slice(0,1000)}`);
-        await sleep(POLL_INTERVAL_MS);
-        continue;
-      }
+      // deliver to Discord
+      await postDiscord(null, embed);
+      logInfo("Wrote update to Discord");
 
-      // At this point we assume data is the expected funding object/array.
-      // Customize parsing if you know exact fields. For safety we just stringify a small payload.
-      const short = JSON.stringify(data).slice(0, 1500);
-      console.log(`Funding update ${SYMBOL}: ${short}`);
-      // Post to Discord summary (compact)
-      await postDiscord(`:white_check_mark: Funding update ${SYMBOL}\nSource: ${url}\n\`\`\`json\n${short}\n\`\`\``);
-
-      // normal poll interval
-      await sleep(POLL_INTERVAL_MS);
+      // wait normal poll interval
+      await wait(POLL_INTERVAL_MS);
     } catch (err) {
       consecutiveErrors++;
-      console.error("Monitor loop exception:", err && err.stack ? err.stack : err);
-      if (consecutiveErrors >= ERROR_ALERT_THRESHOLD) {
-        await postDiscord(`:rotating_light: Monitor crashed repeatedly. Error: ${err && err.message ? err.message : String(err)}\nconsecutiveErrors=${consecutiveErrors}`);
+      logError("Unhandled error in loop:", err);
+      if (consecutiveErrors >= 5) {
+        await postDiscord(`:x: Monitor encountered repeated errors for ${SYMBOL}. last error: ${String(err)}`);
       }
-      // wait & continue
-      await sleep(Math.min(POLL_INTERVAL_MS * consecutiveErrors, 120000));
+      backoffMs = Math.min(60000, (consecutiveErrors ** 2) * 1000);
+      await wait(backoffMs);
     }
   }
 }
 
 // start
-monitorLoop().catch((e) => {
-  console.error("Fatal monitor error:", e);
+mainLoop().catch(err => {
+  logError("Fatal monitor error:", err);
   process.exit(1);
 });

@@ -14,13 +14,23 @@ function buildUpstreamUrl(path, qs = "") {
   // ensure path starts with /
   const p = path.startsWith("/") ? path : `/${path}`;
 
-  // mapping short proxy paths to official CoinGlass API paths
-  const mapping = {
-    "/funding": "/api/pro/v1/futures/funding",
-    "/oi": "/api/pro/v1/futures/openInterest",
-    "/funding-history": "/api/pro/v1/futures/funding-rate/history",
-    "/healthz": "/api/pro/v1/healthz",
-  };
+  // mapping short proxy paths to official CoinGlass API paths (v4)
+const mapping = {
+  // funding snapshot (latest funding rate for symbol)
+  // example proxy:  /funding?symbol=BTC
+  "/funding": "/api/pro/v1/futures/funding-rate",
+
+  // funding history (historical funding rates)
+  // example proxy: /funding-history?symbol=BTC&limit=10&interval=8h
+  "/funding-history": "/api/pro/v1/futures/funding-rate/history",
+
+  // open interest (if you need)
+  "/oi": "/api/pro/v1/futures/openInterest",
+
+  // health check (optional)
+  "/healthz": "/api/pro/v1/healthz"
+};
+
 
   // pick upstream path
   const upstreamPath = mapping[p] || p;
@@ -102,4 +112,5 @@ app.listen(PORT, () => {
   console.log("Available endpoints: /funding /oi /healthz");
   console.log(`COINGLASS_BASE=${COINGLASS_BASE}`);
 });
+
 

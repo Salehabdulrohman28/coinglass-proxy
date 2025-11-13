@@ -1,106 +1,88 @@
 // monitor.js
 import fetch from "node-fetch";
 
-const PROXY_BASE = process.env.PROXY_BASE || "https://coinglass-proxy-9con.onrender.com";
-const SYMBOL = (process.env.SYMBOL || "BTC").toUpperCase();
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL || "";
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 30000);
-const ERROR_ALERT_THRESHOLD = Number(process.env.ERROR_ALERT_THRESHOLD || 3);
+const BASE_URL = process.env.BASE_URL || "https://your-proxy-url.onrender.com";
+const SYMBOL = process.env.SYMBOL || "BTC";
+const INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 30_000);
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK;
+const ERROR_THRESHOLD = Number(process.env.ERROR_THRESHOLD || 2);
 
-let lastFundingRaw = null;
+if (!DISCORD_WEBHOOK) {
+  console.error("No DISCORD_WEBHOOK set. Exiting.");
+  process.exit(1);
+}
+
 let consecutiveErrors = 0;
+let lastFundingHash = null;
 
-async function postDiscord(payload) {
-  if (!DISCORD_WEBHOOK) {
-    console.warn("No DISCORD_WEBHOOK_URL set");
-    return;
-  }
-  try {
-    await fetch(DISCORD_WEBHOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-  } catch (e) {
-    console.error("discord post failed:", e);
-  }
+async function postDiscord(content, embed=null) {
+  const body = { content: content || null };
+  if (embed) body.embeds = [embed];
+  await fetch(DISCORD_WEBHOOK, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(body)
+  });
 }
 
-function buildErrorEmbed(title, message, symbol, url) {
-  return {
-    username: "COINGLASS BOT",
-    embeds: [
-      {
-        title,
-        description: `\`\`\`${message}\`\`\``,
-        color: 15158332,
-        fields: [
-          { name: "symbol", value: symbol, inline: true },
-          { name: "url", value: url || `${PROXY_BASE}/funding?symbol=${symbol}`, inline: false }
-        ],
-        timestamp: new Date().toISOString()
+async function checkOnce() {
+  const url = `${BASE_URL}/funding?symbol=${encodeURIComponent(SYMBOL)}`;
+  try {
+    const r = await fetch(url, { timeout: 10_000 });
+    const json = await r.json();
+    if (r.ok && json.code === 0 && json.data) {
+      // success
+      consecutiveErrors = 0;
+      // build short status and only send when changed (or first run)
+      const payloadStr = JSON.stringify(json.data).slice(0,2000);
+      const hash = payloadStr; // naive
+      if (lastFundingHash !== hash) {
+        lastFundingHash = hash;
+        await postDiscord(null, {
+          title: "Monitor update",
+          description: `Symbol: ${SYMBOL}\nData (truncated):\n\`\`\`${payloadStr}\`\`\``,
+          color: 3066993,
+          timestamp: new Date().toISOString()
+        });
       }
-    ]
-  };
-}
-
-function buildInfoEmbed(title, text) {
-  return {
-    username: "COINGLASS BOT",
-    embeds: [{ title, description: text, color: 3066993, timestamp: new Date().toISOString() }]
-  };
-}
-
-async function fetchFunding() {
-  const url = `${PROXY_BASE}/funding?symbol=${SYMBOL}`;
-  try {
-    const r = await fetch(url, { timeout: 10000 });
-    const text = await r.text();
-    let json;
-    try { json = JSON.parse(text); } catch (e) { json = { raw: text }; }
-    return { ok: r.ok, status: r.status, body: json, url };
+    } else {
+      // upstream reported an error
+      consecutiveErrors++;
+      const detail = JSON.stringify(json).slice(0,1500);
+      console.warn("Monitor error:", detail);
+      if (consecutiveErrors >= ERROR_THRESHOLD) {
+        await postDiscord(null, {
+          title: "Monitor error: funding fetch failed",
+          description: `HTTP ${r.status} -> ${detail}`,
+          color: 16711680,
+          fields: [
+            { name: "symbol", value: SYMBOL, inline: true },
+            { name: "url", value: url, inline: false }
+          ],
+          timestamp: new Date().toISOString()
+        });
+      } else {
+        console.log("Not alerting yet, consecutiveErrors", consecutiveErrors);
+      }
+    }
   } catch (err) {
-    return { ok: false, status: 0, body: { error: String(err) }, url };
-  }
-}
-
-async function poll() {
-  console.log("Fetch funding for", SYMBOL, new Date().toISOString());
-  const res = await fetchFunding();
-  if (!res.ok || (res.body && res.body.success === false && res.status >= 400)) {
     consecutiveErrors++;
-    console.warn("Fetch attempt failed", res.status, res.body);
-    // send error only when exceeds threshold to avoid spam
-    if (consecutiveErrors >= ERROR_ALERT_THRESHOLD) {
-      await postDiscord(buildErrorEmbed("Monitor error: funding fetch failed", JSON.stringify(res.body), SYMBOL, res.url));
-    } else {
-      console.log("Not alerting yet, consecutiveErrors", consecutiveErrors);
-    }
-  } else {
-    // success
-    consecutiveErrors = 0;
-    const nowRaw = JSON.stringify(res.body);
-    if (nowRaw !== lastFundingRaw) {
-      lastFundingRaw = nowRaw;
-      // post a short info or you can change to only post important changes
-      await postDiscord(buildInfoEmbed("Monitor started / update", `Symbol: ${SYMBOL}\nData received (truncated):\n\`\`\`${JSON.stringify(res.body).slice(0,400)}...\`\`\``));
-    } else {
-      // unchanged -> do nothing (suppress duplicates)
-      console.log("No change in funding -> suppressed");
+    console.error("Fetch failed:", err.message);
+    if (consecutiveErrors >= ERROR_THRESHOLD) {
+      await postDiscord(null, {
+        title: "Monitor error: fetch failed",
+        description: `${err.message}`,
+        color: 16711680,
+        fields: [{ name:"symbol", value: SYMBOL }],
+        timestamp: new Date().toISOString()
+      });
     }
   }
 }
 
-(async () => {
-  console.log("Monitor starting {");
-  console.log(" PROXY_BASE:", PROXY_BASE);
-  console.log(" SYMBOL:", SYMBOL);
-  console.log(" POLL_INTERVAL_MS:", POLL_INTERVAL_MS);
-  console.log("}");
-  // send startup message
-  await postDiscord(buildInfoEmbed("Monitor started", `Symbol: ${SYMBOL}`));
-  // loop
-  setInterval(poll, POLL_INTERVAL_MS);
-  // run once immediately
-  poll();
+(async function run(){
+  console.log("Monitor started");
+  await postDiscord(null, { title:"Monitor started", description:`Symbol: ${SYMBOL}`, color: 3066993, timestamp: new Date().toISOString() });
+  await checkOnce();
+  setInterval(checkOnce, INTERVAL_MS);
 })();

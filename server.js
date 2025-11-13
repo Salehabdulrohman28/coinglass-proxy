@@ -11,9 +11,27 @@ const COINGLASS_BASE = process.env.COINGLASS_BASE_URL || "https://open-api-v4.co
 const COINGLASS_API_KEY = process.env.COINGLASS_API_KEY || "";
 
 function buildUpstreamUrl(path, qs = "") {
-  // ensure path starts with /api
+  // ensure path starts with /
   const p = path.startsWith("/") ? path : `/${path}`;
-  return `${COINGLASS_BASE}${p}${qs ? (qs.startsWith("?") ? qs : `?${qs}`) : ""}`;
+
+  // mapping short proxy paths to official CoinGlass API paths
+  const mapping = {
+    "/funding": "/api/pro/v1/futures/funding",
+    "/oi": "/api/pro/v1/futures/openInterest",
+    "/funding-history": "/api/pro/v1/futures/funding-rate/history",
+    "/healthz": "/api/pro/v1/healthz",
+  };
+
+  // pick upstream path
+  const upstreamPath = mapping[p] || p;
+
+  // query string
+  const qsPart = qs ? (qs.startsWith("?") ? qs : `?${qs}`) : "";
+
+  // ensure base has no trailing slash
+  const base = COINGLASS_BASE.replace(/\/+$/, "");
+
+  return `${base}${upstreamPath}${qsPart}`;
 }
 
 async function fetchUpstream(path, qs = "") {
@@ -84,3 +102,4 @@ app.listen(PORT, () => {
   console.log("Available endpoints: /funding /oi /healthz");
   console.log(`COINGLASS_BASE=${COINGLASS_BASE}`);
 });
+

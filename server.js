@@ -5,73 +5,40 @@ import cors from "cors";
 const app = express();
 app.use(cors());
 
-// ==========================================================
 const API_KEY = process.env.COINGLASS_API_KEY;
 if (!API_KEY) {
-  console.error("❌ Missing COINGLASS_API_KEY in environment!");
+  console.error("❌ COINGLASS_API_KEY is missing");
 }
 
-const HEADERS = {
-  "accept": "application/json",
-  "CoinglassSecret": API_KEY
-};
-// ==========================================================
-
-// FUNDING RATE
 app.get("/funding", async (req, res) => {
+  const symbol = req.query.symbol || "BTC";
+
+  const url = `https://api.coinglass.com/api/pro/v1/futures/funding?symbol=${symbol}`;
+
   try {
-    const symbol = req.query.symbol || "BTC";
-
-    const url = `https://open-api.coinglass.com/api/pro/v1/futures/funding?symbol=${symbol}`;
-
-    const response = await fetch(url, { headers: HEADERS });
-    const data = await response.json();
-
-    if (!response.ok) return res.status(response.status).json(data);
-
-    // Ambil hanya Binance data
-    const binance = data.data.find(ex => ex.exchangeName === "Binance");
-
-    res.json({
-      exchange: "Binance",
-      funding_rate: binance?.fundingRate || null
+    const response = await fetch(url, {
+      headers: {
+        "accept": "application/json",
+        "X-COINGLASS-APIKEY": API_KEY
+      }
     });
 
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error("❌ Funding fetch error:", data);
+      return res.status(response.status).json(data);
+    }
+
+    res.json(data);
+
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ Exception:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
-
-// OPEN INTEREST
-app.get("/oi", async (req, res) => {
-  try {
-    const symbol = req.query.symbol || "BTC";
-
-    const url = `https://open-api.coinglass.com/api/pro/v1/futures/openInterest?symbol=${symbol}`;
-
-    const response = await fetch(url, { headers: HEADERS });
-    const data = await response.json();
-
-    if (!response.ok) return res.status(response.status).json(data);
-
-    const binance = data.data.find(ex => ex.exchangeName === "Binance");
-
-    res.json({
-      exchange: "Binance",
-      open_interest_usd: binance?.openInterest || null
-    });
-
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+app.listen(10000, () => {
+  console.log("✔ Coinglass Proxy Running on Port 10000");
+  console.log("✔ Endpoint available: /funding");
 });
-
-// HEALTH CHECK
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
-
-// START SERVER
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Coinglass Proxy Running on Port ${PORT}`));
